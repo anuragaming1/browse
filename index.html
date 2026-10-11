@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="referrer" content="no-referrer">
+<title>Sandbox Browser</title>
+<style>
+  :root{--bg:#0f1115;--bar:#181b22;--fg:#e8eaf0;--mut:#8a90a0;--acc:#5b8cff;--ok:#2ecc71;--bad:#ff5b6e}
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0;background:var(--bg);color:var(--fg);font:14px/1.4 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+  body{display:flex;flex-direction:column}
+  .bar{display:flex;gap:6px;align-items:center;padding:8px;background:var(--bar);border-bottom:1px solid #262a35}
+  button{background:#232734;color:var(--fg);border:0;border-radius:8px;padding:8px 11px;cursor:pointer;font-size:15px}
+  button:hover:not(:disabled){background:#2d3345}
+  button:disabled{opacity:.35;cursor:default}
+  #url{flex:1;min-width:0;background:#0f1115;color:var(--fg);border:1px solid #2b3040;border-radius:8px;padding:9px 12px;font-size:14px;outline:0}
+  #url:focus{border-color:var(--acc)}
+  .opts{display:flex;gap:14px;flex-wrap:wrap;align-items:center;padding:6px 10px;background:#13151b;border-bottom:1px solid #262a35;color:var(--mut);font-size:12px}
+  .opts label{display:flex;gap:5px;align-items:center;cursor:pointer}
+  .opts input[type=text]{background:#0f1115;color:var(--fg);border:1px solid #2b3040;border-radius:6px;padding:4px 8px;width:220px;font-size:12px}
+  #status{margin-left:auto;display:flex;gap:6px;align-items:center}
+  .dot{width:8px;height:8px;border-radius:50%;background:var(--ok)}
+  #stage{position:relative;flex:1;background:#fff}
+  iframe{position:absolute;inset:0;width:100%;height:100%;border:0;background:#fff}
+  #home{position:absolute;inset:0;background:var(--bg);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;text-align:center;padding:20px}
+  #home h1{margin:0;font-size:22px}
+  #home p{margin:0;color:var(--mut);max-width:460px}
+  #toast{position:fixed;left:50%;bottom:18px;transform:translateX(-50%);background:#232734;border:1px solid #333a4d;padding:10px 14px;border-radius:10px;opacity:0;pointer-events:none;transition:.25s;max-width:92vw;text-align:center}
+  #toast.show{opacity:1}
+  #hint{display:none;position:absolute;left:10px;right:10px;bottom:10px;background:#232734;border:1px solid #333a4d;border-radius:10px;padding:10px 12px;font-size:13px}
+  #hint button{padding:5px 9px;font-size:12px;margin-left:6px}
+</style>
+</head>
+<body>
+
+<div class="bar">
+  <button id="back" title="Quay lại" disabled>←</button>
+  <button id="fwd" title="Tiến tới" disabled>→</button>
+  <button id="reload" title="Tải lại">⟳</button>
+  <button id="homeBtn" title="Trang chủ">⌂</button>
+  <input id="url" type="text" inputmode="url" autocapitalize="off" autocomplete="off" spellcheck="false" placeholder="Nhập URL hoặc từ khóa rồi Enter...">
+  <button id="go">Go</button>
+</div>
+
+<div class="opts">
+  <label><input type="checkbox" id="optStrict"> Strict (tắt same-origin: cô lập tuyệt đối, nhưng nhiều web sẽ mất cookie/login)</label>
+  <label><input type="checkbox" id="optAnti" checked> Anti-Return (chặn back/thoát tab ngoài)</label>
+  <label><input type="checkbox" id="optProxy"> Proxy:</label>
+  <input type="text" id="proxyUrl" placeholder="https://proxy-cua-ban.workers.dev/?url=">
+  <span id="status"><span class="dot"></span><span id="statusTxt">Sandbox ON</span></span>
+</div>
+
+<div id="stage">
+  <div id="home">
+    <h1>🛡️ Sandbox Browser</h1>
+    <p>Mọi link bạn nhập hoặc bấm bên trong đều bị nhốt trong khung này. Trang con không thể điều hướng tab chính, không mở popup, không bật alert/modal.</p>
+  </div>
+  <div id="hint">
+    Trang không hiện? Có thể web đó chặn nhúng (X-Frame-Options / CSP).
+    <button id="hintProxy">Bật proxy</button><button id="hintClose">Đóng</button>
+  </div>
+</div>
+<div id="toast"></div>
+
+<script>
+(() => {
+  'use strict';
+  const $ = id => document.getElementById(id);
+  const stage = $('stage'), home = $('home'), urlIn = $('url'), toast = $('toast'), hint = $('hint');
+  const SEARCH = 'https://duckduckgo.com/?q=';
+
+  // ---- Lịch sử riêng (iframe cross-origin thì không đọc được history của nó) ----
+  let stack = [], idx = -1, frame = null, loadTimer = null;
+
+  function notify(msg){
+    toast.textContent = msg; toast.classList.add('show');
+    clearTimeout(notify.t); notify.t = setTimeout(() => toast.classList.remove('show'), 2600);
+  }
+
+  function normalize(raw){
+    raw = raw.trim();
+    if(!raw) return null;
+    if(!/^[a-z][a-z0-9+.-]*:/i.test(raw)){
+      if(/^[^\s]+\.[^\s]{2,}(\/.*)?$/.test(raw) || /^localhost(:\d+)?/.test(raw)) raw = 'https://' + raw;
+      else return SEARCH + encodeURIComponent(raw);
+    }
+    let u;
+    try { u = new URL(raw); } catch { return SEARCH + encodeURIComponent(raw); }
+    // Chỉ cho http/https: chặn javascript:, data:, blob:, file:...
+    if(u.protocol !== 'http:' && u.protocol !== 'https:'){ notify('Chỉ cho phép http/https'); return null; }
+    // Chặn tự nhúng chính nó (tránh escape sandbox khi có allow-same-origin)
+    if(u.origin === location.origin){ notify('Không cho nhúng chính trang này'); return null; }
+    return u.href;
+  }
+
+  function sandboxFlags(){
+    // KHÔNG có: allow-top-navigation*, allow-popups*, allow-modals, allow-downloads, allow-pointer-lock
+    const f = ['allow-scripts','allow-forms'];
+    if(!$('optStrict').checked) f.push('allow-same-origin');
+    return f.join(' ');
+  }
+
+  function buildFrame(src){
+    // Tạo iframe mới mỗi lần điều hướng -> không dồn entry vào session history của tab chính
+    if(frame){ frame.src = 'about:blank'; frame.remove(); }
+    frame = document.createElement('iframe');
+    frame.setAttribute('sandbox', sandboxFlags());
+    frame.setAttribute('referrerpolicy', 'no-referrer');
+    frame.setAttribute('allow', "camera 'none'; microphone 'none'; geolocation 'none'; payment 'none'; usb 'none'; clipboard-read 'none'; fullscreen 'none'");
+    frame.setAttribute('loading', 'eager');
+    frame.addEventListener('load', () => { clearTimeout(loadTimer); hint.style.display = 'none'; });
+    stage.appendChild(frame);
+    home.style.display = 'none';
+    frame.src = src;
+    clearTimeout(loadTimer);
+    loadTimer = setTimeout(() => { hint.style.display = 'block'; }, 6000);
+  }
+
+  function finalSrc(url){
+    if($('optProxy').checked && $('proxyUrl').value.trim()){
+      return $('proxyUrl').value.trim() + encodeURIComponent(url);
+    }
+    return url;
+  }
+
+  function navigate(raw, push = true){
+    const url = normalize(raw);
+    if(!url) return;
+    if(push){ stack = stack.slice(0, idx + 1); stack.push(url); idx = stack.length - 1; }
+    urlIn.value = url;
+    buildFrame(finalSrc(url));
+    syncButtons();
+  }
+
+  function syncButtons(){
+    $('back').disabled = idx <= 0;
+    $('fwd').disabled = idx >= stack.length - 1;
+  }
+
+  $('go').onclick = () => navigate(urlIn.value);
+  urlIn.addEventListener('keydown', e => { if(e.key === 'Enter') navigate(urlIn.value); });
+  urlIn.addEventListener('focus', () => urlIn.select());
+  $('back').onclick = () => { if(idx > 0){ idx--; navigate(stack[idx], false); } };
+  $('fwd').onclick = () => { if(idx < stack.length - 1){ idx++; navigate(stack[idx], false); } };
+  $('reload').onclick = () => { if(stack[idx]) navigate(stack[idx], false); };
+  $('homeBtn').onclick = () => {
+    if(frame){ frame.src = 'about:blank'; frame.remove(); frame = null; }
+    home.style.display = 'flex'; urlIn.value = ''; hint.style.display = 'none';
+  };
+  $('optStrict').onchange = () => { stack[idx] && navigate(stack[idx], false); notify($('optStrict').checked ? 'Strict ON: cô lập tuyệt đối' : 'Strict OFF: có same-origin'); };
+  $('optProxy').onchange = () => { stack[idx] && navigate(stack[idx], false); };
+  $('hintClose').onclick = () => hint.style.display = 'none';
+  $('hintProxy').onclick = () => { $('optProxy').checked = true; $('proxyUrl').focus(); hint.style.display = 'none'; notify('Dán URL proxy của bạn vào ô Proxy'); };
+
+  // ---- ANTI-RETURN: giữ tab chính không bị "quay lại"/rời đi ----
+  // 1) Bẫy history: luôn có 1 entry phía trước, bấm Back thì đẩy lại.
+  function armHistoryTrap(){
+    try{
+      history.replaceState({ trap: 0 }, '', location.href);
+      history.pushState({ trap: 1 }, '', location.href);
+    }catch{}
+  }
+  window.addEventListener('popstate', () => {
+    if(!$('optAnti').checked) return;
+    try{ history.pushState({ trap: 1 }, '', location.href); }catch{}
+    // Back/Alt+← của trình duyệt -> chuyển thành Back của sandbox browser
+    if(idx > 0){ $('back').click(); notify('Back nội bộ (tab chính vẫn đứng yên)'); }
+    else notify('Đã chặn quay lại tab ngoài');
+  });
+  armHistoryTrap();
+
+  // 2) Cảnh báo khi cố đóng/reload/rời tab (nếu đang duyệt trang)
+  window.addEventListener('beforeunload', e => {
+    if($('optAnti').checked && frame){ e.preventDefault(); e.returnValue = ''; }
+  });
+
+  // 3) Chống bị frame-bust ngược: nếu chính trang này bị nhúng vào nơi khác thì không chạy lại
+  //    (tuỳ chọn, bỏ comment nếu muốn chặn bị nhúng)
+  // if(window.top !== window.self){ document.body.innerHTML = '<p style="padding:20px">Không cho nhúng trang này.</p>'; }
+
+  // 4) Phòng thủ phụ: chặn các API mở cửa sổ/điều hướng từ chính trang cha bị gọi nhầm
+  window.open = () => { notify('Popup bị chặn'); return null; };
+
+  // 5) Bắt phím tắt thoát/back rồi chuyển thành nav nội bộ
+  window.addEventListener('keydown', e => {
+    if(!$('optAnti').checked) return;
+    if(e.altKey && (e.key === 'ArrowLeft')){ e.preventDefault(); $('back').click(); }
+    if(e.altKey && (e.key === 'ArrowRight')){ e.preventDefault(); $('fwd').click(); }
+  });
+
+  // Mở thẳng bằng ?u=https://example.com
+  const q = new URLSearchParams(location.search).get('u');
+  if(q) navigate(q);
+})();
+</script>
+</body>
+</html>
